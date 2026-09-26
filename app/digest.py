@@ -14,6 +14,11 @@ _PANEL_MAX_SEQUENCE_LENGTH = 2000
 _PANEL_MIN_ENZYMES = 1
 _PANEL_MAX_ENZYMES = 10
 
+_ERASE_MAX_SEQUENCE_LENGTH = 500
+_ERASE_MIN_ENZYMES = 1
+_ERASE_MAX_ENZYMES = 8
+_ERASE_MAX_EDITS = 10
+
 
 class DigestError(ValueError):
     """输入非法或切点越界时抛出，reason 为可直接展示给调用方的中文原因。"""
@@ -414,4 +419,173 @@ def run_design_panel(payload: Any) -> dict:
         "enzyme_indices": indices,
         "enzyme_count": len(indices),
         "profiles": selected_profiles,
+    }
+
+
+# ---------------------------------------------------------------------------
+# /erase-sites：从候选替换编辑中选最少的一组，清除全部目标酶识别位点
+# ---------------------------------------------------------------------------
+
+
+def _find_site_starts(
+    seq: str, enzymes: list[dict], topology: str
+) -> list[set[int]]:
+    """按与 _find_cuts 相同的正反链与环状跨原点规则识别位点。
+
+    返回与 enzymes 等长的列表，每项为该酶命中位点的起点集合（0 基）。
+    搜索区间（环状取 seq + seq[:L-1]、线性取 seq）与两种模式（识别序列
+    本身及其反向互补）与 _find_cuts 完全一致，仅用 str.find 逐位推进匹配，
+    因此重叠位点同样能识别。同一起点上正向与反向命中（回文识别序列必然
+    成对出现）通过集合去重，计为一个位点。
+    """
+    n = len(seq)
+    circular = topology == "circular"
+    site_table: list[set[int]] = []
+
+    for enzyme in enzymes:
+        recognition = enzyme["recognition"]
+        length = len(recognition)
+        rc = reverse_complement(recognition)
+
+        if circular:
+            # 与 _find_cuts 一致：首尾相接拼接 length-1 个碱基，环上只有 n 个起点
+            search = seq + seq[: length - 1]
+            limit = n
+        else:
+            search = seq
+            limit = max(0, n - length + 1)
+
+        sites: set[int] = set()
+        for pattern in (recognition, rc):
+            start = search.find(pattern)
+            while start != -1 and start < limit:
+                # find 只返回完整匹配：环状下 start 必在 0..n-1，线性下不越右端
+                sites.add(start % n if circular else start)
+                start = search.find(pattern, start + 1)
+        site_table.append(sites)
+
+    return site_table
+
+
+def _validate_edits(raw: Any, sequence: str) -> list[dict]:
+    """校验候选替换编辑：每项含 0 基 position 与必须改变原碱基的 A/C/G/T base。"""
+    if raw is None:
+        raise DigestError("缺少 edits 字段；无候选编辑时请传空数组 []")
+    if not isinstance(raw, list):
+        raise DigestError("edits 必须是数组")
+    if len(raw) > _ERASE_MAX_EDITS:
+        raise DigestError(
+            f"候选编辑数量最多为 {_ERASE_MAX_EDITS} 个，当前为 {len(raw)}"
+        )
+
+    n = len(sequence)
+    edits: list[dict] = []
+    seen_positions: set[int] = set()
+    for i, item in enumerate(raw):
+        label = f"第 {i + 1} 个编辑"
+        if not isinstance(item, dict):
+            raise DigestError(f"{label} 必须是对象")
+
+        position = item.get("position")
+        if not _is_real_int(position):
+            raise DigestError(f"{label} 的 position 必须是整数（0 基）")
+        if not (0 <= position < n):
+            raise DigestError(
+                f"{label} 的 position {position} 越界；"
+                f"序列长度为 {n}，合法范围为 0..{n - 1}（0 基）"
+            )
+        if position in seen_positions:
+            raise DigestError(
+                f"{label} 的 position {position} 与前面的编辑重复；"
+                "同一位置不得出现多个候选编辑"
+            )
+
+        base = item.get("base")
+        if not isinstance(base, str):
+            raise DigestError(f"{label} 的 base 必须是字符串 A/C/G/T")
+        base = base.strip().upper()
+        if base not in _BASES:
+            raise DigestError(
+                f"{label} 的 base 非法：{item.get('base')!r}；仅允许 A/C/G/T"
+            )
+        if base == sequence[position]:
+            raise DigestError(
+                f"{label}（position {position}）替换后的碱基 {base} "
+                f"与原碱基相同；编辑必须改变原碱基"
+            )
+
+        seen_positions.add(position)
+        edits.append({"position": position, "base": base})
+    return edits
+
+
+def run_erase_sites(payload: Any) -> dict:
+    """校验请求体并搜索最少替换编辑以清除全部识别位点。
+
+    每组候选编辑同时应用后，对完整序列重新扫描（环状含跨原点），
+    避免局部消除却在编辑点附近生成新位点。按改动数最少、同数时输入下标
+    列表字典序最小择优；无任何组合可行时返回 no_solution。
+    """
+    if not isinstance(payload, dict):
+        raise DigestError("请求体必须是 JSON 对象")
+
+    seq = _validate_sequence(payload.get("sequence"))
+    if len(seq) > _ERASE_MAX_SEQUENCE_LENGTH:
+        raise DigestError(
+            f"序列长度为 {len(seq)}，超过上限 {_ERASE_MAX_SEQUENCE_LENGTH} 碱基"
+        )
+    topology = _validate_topology(payload.get("topology"))
+    enzymes = _validate_enzymes(payload.get("enzymes"))
+    if not (_ERASE_MIN_ENZYMES <= len(enzymes) <= _ERASE_MAX_ENZYMES):
+        raise DigestError(
+            f"目标酶数量必须在 {_ERASE_MIN_ENZYMES}..{_ERASE_MAX_ENZYMES} 之间，"
+            f"当前为 {len(enzymes)}"
+        )
+    edits = _validate_edits(payload.get("edits"), seq)
+
+    original_sites = _find_site_starts(seq, enzymes, topology)
+    original_counts = [len(sites) for sites in original_sites]
+
+    # 候选至多 10 个，子集总数不超过 1024；按规模递增、同规模按下标升序枚举，
+    # 遇到的第一个可行组合即为“改动最少、同数下标序列字典序最小”的解。
+    m = len(edits)
+    chosen: tuple[int, ...] | None = None
+    edited = seq
+    remaining_sites: list[set[int]] = original_sites
+    for size in range(0, m + 1):
+        for combo in itertools.combinations(range(m), size):
+            candidate = seq
+            for idx in combo:
+                edit = edits[idx]
+                pos = edit["position"]
+                candidate = (
+                    candidate[:pos] + edit["base"] + candidate[pos + 1 :]
+                )
+            remaining_sites = _find_site_starts(candidate, enzymes, topology)
+            if not any(remaining_sites):
+                chosen = combo
+                edited = candidate
+                break
+        if chosen is not None:
+            break
+
+    if chosen is None:
+        return {"status": "no_solution"}
+
+    return {
+        "status": "solution",
+        "sequence": edited,
+        "length": len(edited),
+        "topology": topology,
+        "edit_indices": list(chosen),
+        "edit_count": len(chosen),
+        "enzyme_sites": [
+            {
+                "name": enzymes[i]["name"],
+                "recognition": enzymes[i]["recognition"],
+                "original_sites": original_counts[i],
+                "remaining_sites": len(remaining_sites[i]),
+            }
+            for i in range(len(enzymes))
+        ],
     }
