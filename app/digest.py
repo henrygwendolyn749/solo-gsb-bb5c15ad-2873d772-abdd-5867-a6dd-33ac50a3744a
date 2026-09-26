@@ -14,6 +14,11 @@ _PANEL_MAX_SEQUENCE_LENGTH = 2000
 _PANEL_MIN_ENZYMES = 1
 _PANEL_MAX_ENZYMES = 10
 
+_ERASE_MAX_SEQUENCE_LENGTH = 500
+_ERASE_MIN_ENZYMES = 1
+_ERASE_MAX_ENZYMES = 8
+_ERASE_MAX_EDITS = 10
+
 
 class DigestError(ValueError):
     """输入非法或切点越界时抛出，reason 为可直接展示给调用方的中文原因。"""
@@ -414,4 +419,137 @@ def run_design_panel(payload: Any) -> dict:
         "enzyme_indices": indices,
         "enzyme_count": len(indices),
         "profiles": selected_profiles,
+    }
+
+
+# ---------------------------------------------------------------------------
+# /erase-sites：挑选最少的候选碱基替换，消除全部酶识别位点
+# ---------------------------------------------------------------------------
+
+
+def _validate_edits(raw: Any, seq: str) -> list[dict]:
+    if raw is None:
+        raise DigestError("缺少 edits 字段；无候选替换时请传空数组 []")
+    if not isinstance(raw, list):
+        raise DigestError("edits 必须是数组")
+    if len(raw) > _ERASE_MAX_EDITS:
+        raise DigestError(
+            f"edits 数量不能超过 {_ERASE_MAX_EDITS}，当前为 {len(raw)}"
+        )
+
+    n = len(seq)
+    edits: list[dict] = []
+    seen_positions: set[int] = set()
+    for i, item in enumerate(raw):
+        label = f"第 {i + 1} 个候选替换"
+        if not isinstance(item, dict):
+            raise DigestError(f"{label} 必须是对象")
+
+        position = item.get("position")
+        if not _is_real_int(position):
+            raise DigestError(f"{label} 的 position 必须是整数（0 基下标）")
+        if not (0 <= position < n):
+            raise DigestError(
+                f"{label} 的 position {position} 越界；"
+                f"序列长度为 {n}，合法范围 0..{n - 1}"
+            )
+        if position in seen_positions:
+            raise DigestError(
+                f"{label} 与之前的候选替换指向同一位置 {position}；"
+                f"每个位置至多出现一个候选替换"
+            )
+        seen_positions.add(position)
+
+        base = item.get("base")
+        if not isinstance(base, str):
+            raise DigestError(f"{label} 的 base 必须是字符串")
+        base = base.strip().upper()
+        if len(base) != 1 or base not in _BASES:
+            raise DigestError(f"{label} 的 base 必须是单个 A/C/G/T 碱基")
+        if base == seq[position]:
+            raise DigestError(
+                f"{label}（位置 {position}）的 base 与原碱基 "
+                f"{seq[position]!r} 相同；候选替换必须改变原碱基"
+            )
+
+        edits.append({"position": position, "base": base})
+    return edits
+
+
+def _enzyme_site_counts(
+    seq: str, enzymes: list[dict], topology: str
+) -> list[int]:
+    """每个酶的识别位点数（与 /digest 完全相同的正反链、环状跨首尾识别规则）。
+
+    同一酶在同一起点的正向与反向互补命中（回文识别序列）只计为一个位点。
+    """
+    _cuts, hits = _find_cuts(seq, enzymes, topology)
+    return [len({h["site_start"] for h in entry["hits"]}) for entry in hits]
+
+
+def _apply_edits(seq: str, edits: list[dict], indices: tuple[int, ...]) -> str:
+    """把下标为 indices 的一组候选替换同时应用到序列上，返回修改后的序列。"""
+    chars = list(seq)
+    for i in indices:
+        chars[edits[i]["position"]] = edits[i]["base"]
+    return "".join(chars)
+
+
+def run_erase_sites(payload: Any) -> dict:
+    """校验请求体并搜索消除全部识别位点的最少候选替换组合。"""
+    if not isinstance(payload, dict):
+        raise DigestError("请求体必须是 JSON 对象")
+
+    seq = _validate_sequence(payload.get("sequence"))
+    if len(seq) > _ERASE_MAX_SEQUENCE_LENGTH:
+        raise DigestError(
+            f"序列长度为 {len(seq)}，超过上限 {_ERASE_MAX_SEQUENCE_LENGTH} 碱基"
+        )
+    topology = _validate_topology(payload.get("topology"))
+    enzymes = _validate_enzymes(payload.get("enzymes"))
+    if not (_ERASE_MIN_ENZYMES <= len(enzymes) <= _ERASE_MAX_ENZYMES):
+        raise DigestError(
+            f"酶数量必须在 {_ERASE_MIN_ENZYMES}..{_ERASE_MAX_ENZYMES} 之间，"
+            f"当前为 {len(enzymes)}"
+        )
+    edits = _validate_edits(payload.get("edits"), seq)
+
+    original_counts = _enzyme_site_counts(seq, enzymes, topology)
+
+    # 按“改动数最少、同数时输入下标列表字典序最小”枚举候选替换子集。
+    # 每组替换同时应用后重新扫描全序列：只有修改后任何酶都不再命中的组合
+    # 才可取——局部消除旧位点却又生成新位点的组合会被重新扫描否决。
+    m = len(edits)
+    chosen: list[int] | None = None
+    edited = seq
+    remaining_counts = original_counts
+    for size in range(0, m + 1):
+        for combo in itertools.combinations(range(m), size):
+            candidate = _apply_edits(seq, edits, combo)
+            counts = _enzyme_site_counts(candidate, enzymes, topology)
+            if all(c == 0 for c in counts):
+                chosen = list(combo)
+                edited = candidate
+                remaining_counts = counts
+                break
+        if chosen is not None:
+            break
+
+    if chosen is None:
+        return {"status": "no_solution"}
+
+    return {
+        "status": "solution",
+        "edited_sequence": edited,
+        "edit_indices": chosen,
+        "edit_count": len(chosen),
+        "enzymes": [
+            {
+                "name": enzyme["name"],
+                "recognition": enzyme["recognition"],
+                "original_sites": original_counts[i],
+                "remaining_sites": remaining_counts[i],
+            }
+            for i, enzyme in enumerate(enzymes)
+        ],
     }

@@ -13,6 +13,10 @@
 `POST /design-panel` 进一步支持一次提交 2～8 个 DNA 样本与 1～10 个候选酶，
 **搜索能用联合酶切谱把任意两个样本相互区分开的最少酶组合**（详见下文）。
 
+`POST /erase-sites` 则面向**位点消除**：给定一条序列、1～8 个酶和至多 10 个候选
+碱基替换，**挑选改动数最少的一组替换同时应用，使修改后的序列不再含任何目标酶的
+识别位点**（详见下文）。
+
 ## 单条命令启动（一键启动）
 
 需要 Docker（含 Compose 插件 v2）。在项目根目录执行：
@@ -22,7 +26,8 @@ docker compose up --build
 ```
 
 该命令会自动完成：构建镜像 → 安装 `requirements.txt` 中的全部依赖（FastAPI、uvicorn）
-→ 构建期导入校验（应用与 `/digest`、`/design-panel` 路由可正常装配）→ 启动服务。
+→ 构建期导入校验（应用与 `/digest`、`/design-panel`、`/erase-sites` 路由可正常装配）
+→ 启动服务。
 首次构建需要联网下载依赖，之后的重建会命中 Docker 层缓存。加 `-d` 可后台运行
 （`docker compose up --build -d`）。
 
@@ -35,6 +40,7 @@ docker compose up --build
 | 健康检查 | http://localhost:8000/health |
 | 单样本酶切接口 | `POST http://localhost:8000/digest` |
 | 多样本鉴别酶组合设计接口 | `POST http://localhost:8000/design-panel` |
+| 识别位点消除接口 | `POST http://localhost:8000/erase-sites` |
 
 停止服务：前台运行按 `Ctrl+C`；后台运行执行：
 
@@ -247,6 +253,88 @@ curl -s -X POST http://localhost:8000/design-panel \
 `tolerance>=1` 时逐位差均不超过容差，视为不可区分（若无其他酶可用则返回
 `no_solution`）。片段数不同时（如 `[8]` 与 `[3, 5]`），无论容差多大都可区分。
 
+### `POST /erase-sites`
+
+从给定的候选碱基替换中挑选一组同时应用到序列上，使修改后的序列**不再含任何目标酶的
+识别位点**。识别规则与 `/digest` 完全一致：同时搜索正向识别序列与其反向互补序列，
+环状序列识别跨首尾（原点）的位点；**同一酶在同一起点的正反链命中只计为一个位点**
+（回文识别序列不会产生重复计数）。
+
+**位点清零的判定针对修改后的完整序列：** 每组候选替换**同时应用**后会**重新扫描全
+序列**，因此“局部消除了旧位点、却又生成了新位点”的组合会被正确否决。只有所有酶在
+修改后序列上的命中数均为 0，该组合才可行。
+
+**选择规则（确定性）：** 在所有可行组合中，
+
+1. 先取**改动数最少**的（原序列本就没有位点时，空组合即为最优，返回未修改的序列）；
+2. 改动数相同则取候选替换**输入下标列表字典序最小**的（下标从 0 开始，按输入顺序）。
+
+不存在任何可行组合时返回 `{"status": "no_solution"}`。
+
+**请求体（JSON）：**
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `sequence` | string | 是 | DNA 序列，规则同 `/digest`，长度不得超过 `500` 碱基 |
+| `topology` | string | 是 | `linear`（线性）或 `circular`（环状），大小写不敏感 |
+| `enzymes` | array | 是 | 目标酶数组，数量 `1..8`，每项格式与 `/digest` 的 `enzymes[]` 完全一致 |
+| `edits` | array | 是 | 候选替换数组，数量 `0..10`；无候选替换时传 `[]` |
+| `edits[].position` | integer | 是 | 待替换碱基的 **0 基**下标，合法范围 `0 .. 序列长度-1`；各候选位置**不得重复** |
+| `edits[].base` | string | 是 | 替换后的碱基，单个 `A/C/G/T`（大小写均可），且**必须不同于该位置原碱基** |
+
+**响应（找到方案）：**
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"solution"` |
+| `edited_sequence` | 应用所选替换后的完整序列（长度不变） |
+| `edit_indices` | 所选候选替换在输入 `edits` 中的下标列表（升序），即改动数最少且字典序最小者 |
+| `edit_count` | 所选替换数量 |
+| `enzymes` | 逐酶位点统计，顺序与输入 `enzymes` 一致 |
+| `enzymes[].name` / `recognition` | 酶名称 / 识别序列 |
+| `enzymes[].original_sites` | 该酶在**原序列**中的识别位点数（同一起点正反链命中计一个） |
+| `enzymes[].remaining_sites` | 该酶在**修改后序列**中的剩余识别位点数（找到方案时恒为 0） |
+
+无法清除时仅返回：
+
+```json
+{"status": "no_solution"}
+```
+
+### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/erase-sites \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sequence": "AAGAATTCTTTGAATTCGG",
+    "topology": "linear",
+    "enzymes": [{"name": "EcoRI", "recognition": "GAATTC", "cut_offset": 1}],
+    "edits": [
+      {"position": 3,  "base": "T"},
+      {"position": 12, "base": "T"}
+    ]
+  }'
+```
+
+### 响应示例
+
+```json
+{
+  "status": "solution",
+  "edited_sequence": "AAGTATTCTTTGTATTCGG",
+  "edit_indices": [0, 1],
+  "edit_count": 2,
+  "enzymes": [
+    {"name": "EcoRI", "recognition": "GAATTC", "original_sites": 2, "remaining_sites": 0}
+  ]
+}
+```
+
+上例中 EcoRI 识别回文序列 `GAATTC`，原序列在位置 2 与 11 各有一个位点（每个位点的
+正反链命中只计一次，故 `original_sites` 为 2）。两个候选替换分别破坏一个位点，单独
+应用任一个都无法清零，因此最少改动为 2，两个替换同时应用后全序列不再含 `GAATTC`。
+
 ## 错误响应
 
 所有输入类错误返回 HTTP `400`，响应体形如 `{"error": "中文原因说明"}`，例如：
@@ -262,9 +350,14 @@ curl -s -X POST http://localhost:8000/design-panel \
 - `样本 's1' 的序列长度为 2001，超过上限 2000 碱基`
 - `候选酶数量必须在 1..10 之间，当前为 0`
 - `tolerance 必须是非负整数`
+- `序列长度为 501，超过上限 500 碱基`
+- `酶数量必须在 1..8 之间，当前为 9`
+- `edits 数量不能超过 10，当前为 11`
+- `第 2 个候选替换与之前的候选替换指向同一位置 7；每个位置至多出现一个候选替换`
+- `第 1 个候选替换（位置 4）的 base 与原碱基 'A' 相同；候选替换必须改变原碱基`
 
-`/design-panel` 的无方案结果（`{"status": "no_solution"}`）属于正常业务结果，
-返回 HTTP `200`，不是错误。
+`/design-panel` 与 `/erase-sites` 的无方案结果（`{"status": "no_solution"}`）属于
+正常业务结果，返回 HTTP `200`，不是错误。
 
 ## 本地开发（不使用 Docker）
 
@@ -281,6 +374,7 @@ uvicorn app.main:app --reload --port 8000
 ```bash
 python3 tests/test_digest.py
 python3 tests/test_design_panel.py
+python3 tests/test_erase_sites.py
 ```
 
 `test_digest.py` 覆盖：正向/反向命中与切点换算、回文酶的成对切点、环状跨首尾位点、切点
@@ -294,17 +388,24 @@ python3 tests/test_design_panel.py
 环状联合酶切、返回谱与 `/digest` 逐样本一致，以及样本数量/重名/长度上限/酶数量/
 容差类型等各类非法输入 400。
 
+`test_erase_sites.py` 覆盖：最少改动数与下标字典序择优、空替换组（原序列本无位点）、
+同时应用后重新扫描否决“消除旧位点又生成新位点”的组合、回文酶同一起点正反链只计
+一个位点、反向互补链位点、环状跨原点（跨首尾）位点消除、多酶逐酶原有/剩余位点统计、
+无法清除时 `no_solution`、500/501 碱基与 8/9 酶与 10/11 个候选替换的边界，以及位置
+越界/重复、替换碱基非法或等于原碱基等各类非法输入 400。
+
 ## 项目结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── digest.py          # 酶切与鉴别酶组合核心逻辑（纯函数，可独立测试）
-│   └── main.py            # FastAPI 入口与错误处理（/digest、/design-panel）
+│   ├── digest.py          # 酶切、鉴别酶组合与位点消除核心逻辑（纯函数，可独立测试）
+│   └── main.py            # FastAPI 入口与错误处理（/digest、/design-panel、/erase-sites）
 ├── tests/
 │   ├── test_digest.py         # /digest 纯标准库测试脚本
-│   └── test_design_panel.py   # /design-panel 纯标准库测试脚本
+│   ├── test_design_panel.py   # /design-panel 纯标准库测试脚本
+│   └── test_erase_sites.py    # /erase-sites 纯标准库测试脚本
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

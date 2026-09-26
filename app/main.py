@@ -8,13 +8,15 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from .digest import DigestError, run_design_panel, run_digest
+from .digest import DigestError, run_design_panel, run_digest, run_erase_sites
 
 app = FastAPI(
     title="DNA 限制酶切模拟 API",
     description=(
         "输入仅含 A/C/G/T 的序列、线性/环状拓扑与若干酶的识别序列和切点偏移，"
         "按切点返回原链顺序的片段。同时搜索正向识别序列与其反向互补序列。"
+        "另支持多样本鉴别酶组合设计，以及挑选最少候选碱基替换以消除全部"
+        "酶识别位点。"
     ),
     version="1.0.0",
 )
@@ -63,6 +65,21 @@ async def design_panel(request: Request) -> dict[str, Any]:
     except Exception:
         raise DigestError("请求体必须是合法的 JSON 对象")
     return run_design_panel(payload)
+
+
+@app.post(
+    "/erase-sites",
+    summary="挑选最少的候选碱基替换，消除全部酶识别位点",
+    responses={
+        400: {"description": "序列/拓扑/酶/候选替换非法"},
+    },
+)
+async def erase_sites(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except Exception:
+        raise DigestError("请求体必须是合法的 JSON 对象")
+    return run_erase_sites(payload)
 
 
 if __name__ == "__main__":
